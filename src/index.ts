@@ -718,14 +718,20 @@ export default {
 //           缓冲带 8MB 硬上限，超上限降级纯流式 + 方案一容错（避免撞 CF 1102 资源超限）
 
 const MAX_BUFFER = 8 * 1024 * 1024; // 8MB：超此上限不缓冲，降级纯流式，规避 Worker 内存资源上限
+const UPSTREAM_IDLE_TIMEOUT = 60_000; // 上游流连续无数据超过此时长才中断，keepalive 不重置该计时
 
 // 方案一 + 三：监控 SSE 流，异常中断补 response.completed(incomplete)；空闲注入心跳
-function makeResponsesStreamGuard(model: string): TransformStream<Uint8Array, Uint8Array> {
+function makeResponsesStreamGuard(
+  model: string,
+  abortUpstream?: () => void
+): TransformStream<Uint8Array, Uint8Array> {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
   let seenCompleted = false;
   let seenOutput = false;
   let timer: any = null;
+  let idleTimer: any = null;
+  let idleTimedOut = false;
   let lastChunk = Date.now();
   let ctrlRef: TransformStreamDefaultController<Uint8Array> | null = null;
 
@@ -749,6 +755,10 @@ function makeResponsesStreamGuard(model: string): TransformStream<Uint8Array, Ui
     if (timer) {
       clearInterval(timer);
       timer = null;
+    }
+    if (idleTimer) {
+      clearInterval(idleTimer);
+      idleTimer = null;
     }
     if (!seenCompleted) {
       // 上游流异常截断（200 但没发结束事件）。分两种情况：
@@ -795,6 +805,17 @@ function makeResponsesStreamGuard(model: string): TransformStream<Uint8Array, Ui
       lastChunk = Date.now();
       timer = setInterval(() => {
         if (Date.now() - lastChunk >= 3000) keepAlive();
+      }, 1000);
+      idleTimer = setInterval(() => {
+        if (!idleTimedOut && Date.now() - lastChunk >= UPSTREAM_IDLE_TIMEOUT) {
+          idleTimedOut = true;
+          abortUpstream?.();
+          try {
+            controller.error(new Error('upstream stream idle timeout (>60s)'));
+          } catch {
+            /* 下游已关闭，忽略 */
+          }
+        }
       }, 1000);
     },
     transform(chunk, controller) {
@@ -969,7 +990,7 @@ function jsonErrHeaders(): Headers {
 // 方案二（B 版·朴素透明转发）：gpt/luna 的 /responses 请求原样透传上游 SSE。
 // 不做 stream:false 缓冲、不做重试、不返回 incomplete 假成功；仅挂 keepalive 防 Codex 断连重发。
 // 上游非 200（429/500/模型不存在等）原样透传状态码+body，由客户端(Codex)自行处理。
-const UPSTREAM_TIMEOUT = 60_000; // 拦截上游推理池 hang；正常推理远小于此，不影响 200 通路
+const UPSTREAM_HEADERS_TIMEOUT = 60_000; // 仅限制等待上游响应头；流建立后由 idle timeout 负责
 
 async function handleResponsesPassthroughWithRetry(
   rb: any,
@@ -978,7 +999,7 @@ async function handleResponsesPassthroughWithRetry(
 ): Promise<Response> {
   const model = String(rb.model || '');
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT);
+  const timer = setTimeout(() => ac.abort(), UPSTREAM_HEADERS_TIMEOUT);
   let resp: Response;
   try {
     // 原样透传 stream:true 到上游；Authorization 等 headers 由调用方原样传入（透传优先）
@@ -995,9 +1016,8 @@ async function handleResponsesPassthroughWithRetry(
       JSON.stringify({ error: 'upstream_unavailable', message: 'upstream timed out or unreachable (>60s)' }),
       { status: 504, headers: jsonErrHeaders() }
     );
-  } finally {
-    clearTimeout(timer);
   }
+  clearTimeout(timer);
 
   // 上游明确错误（模型不存在 / 限流 / 500 等）：原样透传，由 Codex 自行处理、自行决定是否重试
   if (!resp.ok) {
@@ -1011,7 +1031,7 @@ async function handleResponsesPassthroughWithRetry(
   oh.set('content-type', 'text/event-stream; charset=utf-8');
   oh.set('cache-control', 'no-cache');
   oh.set('Access-Control-Allow-Origin', '*');
-  return new Response(resp.body!.pipeThrough(makeResponsesStreamGuard(model)), { status: 200, headers: oh });
+  return new Response(resp.body!.pipeThrough(makeResponsesStreamGuard(model, () => ac.abort())), { status: 200, headers: oh });
 }
 
 interface Env {
