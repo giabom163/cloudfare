@@ -952,32 +952,6 @@ function byteLengthOf(s: string): number {
   }
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-// 【v10】永不返错兜底：返回 200 + 成功结束的 incomplete 流。
-// 客户端（Codex responses 协议）收到后视为正常完成、不会重发大请求，
-// 从而杜绝「上游错误 → 客户端重发 → 大上下文重复计费」的 token 浪费。
-function incompleteSSE(model: string, reason: string): string {
-  const rid = 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24);
-  const created = { type: 'response.created', response: baseResponse(rid, model, 'in_progress', []) };
-  const done = baseResponse(rid, model, 'incomplete', []);
-  done.incomplete_details = { reason };
-  done.usage = mapUsage(undefined);
-  const completed = { type: 'response.completed', response: done };
-  return (
-    `event: response.created\ndata: ${JSON.stringify(created)}\n\n` +
-    `event: response.completed\ndata: ${JSON.stringify(completed)}\n\n`
-  );
-}
-
-function sseHeaders(): Headers {
-  const h = new Headers();
-  h.set('content-type', 'text/event-stream; charset=utf-8');
-  h.set('cache-control', 'no-cache');
-  h.set('Access-Control-Allow-Origin', '*');
-  return h;
-}
-
 function jsonErrHeaders(): Headers {
   const h = new Headers();
   h.set('content-type', 'application/json');
