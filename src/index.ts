@@ -761,13 +761,10 @@ function makeResponsesStreamGuard(
       idleTimer = null;
     }
     if (!seenCompleted) {
-      // 上游流异常截断（200 但没发结束事件）。分两种情况：
-      //   1) 收到过真实内容（output_text.delta / output_item.added / function_call 等）→ 补 response.completed(status:completed)，
-      //      内容已真实收到，仅兜底结束事件，避免 Codex 判定失败重发。
-      //   2) 完全没收到任何 output（上游返回空流 / store 异常）→ 回退 response.completed(status:incomplete)，
-      //      让 Codex 识别为「未完成」而非「正常空回复」，从而重试或报错，而不是吞掉空结果。
+      // 上游流异常截断（200 但没发结束事件）。无论是否收到内容，都明确标记为 incomplete，
+      // 禁止把“有内容但没有正常结束”伪装成完整成功；让 Codex 自己决定重试或报错。
       const hasContent = seenOutput;
-      const status = hasContent ? 'completed' : 'incomplete';
+      const status = 'incomplete';
       const respObj: any = {
         id: 'resp_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
         object: 'response',
@@ -789,9 +786,9 @@ function makeResponsesStreamGuard(
           output_tokens_details: { reasoning_tokens: 0 },
         },
       };
-      if (!hasContent) {
-        respObj.incomplete_details = { reason: 'upstream_empty_stream' };
-      }
+      respObj.incomplete_details = {
+        reason: hasContent ? 'upstream_stream_ended_without_completed' : 'upstream_empty_stream',
+      };
       send(c, 'response.completed', {
         type: 'response.completed',
         response: respObj,
