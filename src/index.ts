@@ -415,9 +415,8 @@ function makeChatToResponsesStream(model: string): TransformStream<Uint8Array, U
   });
 }
 
-// 桥接主流程：拿已解析的 responses 请求体，转 chat 打上游，响应转回 responses
-// 桥接主流程：拿已解析的 responses 请求体，转 chat 打上游，响应转回 responses
-// 【v10】永不返错：上游快速失败重试 2 次（换 session + 退避）；超时/网络/持续错误/非 JSON → incomplete 流兜底
+// 桥接主流程：拿已解析的 responses 请求体，转 chat 打上游，响应转回 responses。
+// 上游错误原样保留状态码，网络/超时返回真实错误；流式响应继续由 guard 负责空闲中断。
 async function handleChatBridge(
   rb: AnyObj,
   headers: Headers,
@@ -427,41 +426,43 @@ async function handleChatBridge(
   const chatBody = responsesToChatRequest(rb);
   const chatUrl = new URL(upstreamUrl.toString().replace(/\/responses(\?|$)/, '/chat/completions$1'));
 
-  const doFetch = async (newSession: boolean): Promise<Response> => {
-    const h = new Headers(headers);
-    if (newSession) h.set('x-opencode-session', crypto.randomUUID().replace(/-/g, '').slice(0, 32));
+  const doFetch = async (): Promise<{ response: Response; abort: () => void }> => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT);
     try {
-      return await fetch(chatUrl.toString(), {
+      const response = await fetch(chatUrl.toString(), {
         method: 'POST',
-        headers: h,
+        headers,
         body: JSON.stringify(chatBody),
         signal: ac.signal,
       });
-    } finally {
       clearTimeout(timer);
+      return { response, abort: () => ac.abort() };
+    } catch (error) {
+      clearTimeout(timer);
+      throw error;
     }
   };
 
-  // 重试：快速失败（上游非 2xx）换 session 重试 2 次（退避 1s/3s）；超时/网络失败直接跳出走兜底
-  let resp: Response | undefined;
-  let timedOut = false;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      resp = await doFetch(attempt > 0);
-    } catch {
-      timedOut = true;
-      break;
-    }
-    if (resp.ok) break;
-    if (attempt < 2) await sleep(attempt === 0 ? 1000 : 3000);
+  let fetched: { response: Response; abort: () => void };
+  try {
+    fetched = await doFetch();
+  } catch {
+    return new Response(
+      JSON.stringify({ error: 'upstream_unavailable', message: 'chat upstream timed out or unreachable (>60s)' }),
+      { status: 504, headers: jsonErrHeaders() }
+    );
   }
 
-  // 超时/网络失败，或上游持续错误 → 永不返错兜底（返回 incomplete 流，客户端不重发）
-  if (timedOut || !resp || !resp.ok) {
-    const reason = timedOut ? 'upstream_unavailable' : 'upstream_error_' + (resp?.status ?? 0);
-    return new Response(incompleteSSE(model, reason), { status: 200, headers: sseHeaders() });
+  const resp = fetched.response;
+  if (!resp.ok) {
+    const outHeaders = new Headers(resp.headers);
+    outHeaders.set('Access-Control-Allow-Origin', '*');
+    return new Response(resp.body, {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: outHeaders,
+    });
   }
 
   const outHeaders = new Headers();
@@ -470,7 +471,9 @@ async function handleChatBridge(
   if (chatBody.stream) {
     outHeaders.set('content-type', 'text/event-stream; charset=utf-8');
     outHeaders.set('cache-control', 'no-cache');
-    const converted = resp.body!.pipeThrough(makeChatToResponsesStream(model)).pipeThrough(makeResponsesStreamGuard(model));
+    const converted = resp.body!
+      .pipeThrough(makeChatToResponsesStream(model))
+      .pipeThrough(makeResponsesStreamGuard(model, fetched.abort));
     return new Response(converted, { status: 200, headers: outHeaders });
   }
 
@@ -478,8 +481,10 @@ async function handleChatBridge(
   try {
     cr = await resp.json();
   } catch {
-    // 上游返回非 JSON：兜底 incomplete 流（不返 502，避免客户端重发）
-    return new Response(incompleteSSE(model, 'bridge_bad_upstream'), { status: 200, headers: sseHeaders() });
+    return new Response(
+      JSON.stringify({ error: 'bridge_invalid_json', message: 'chat upstream returned invalid JSON' }),
+      { status: 502, headers: jsonErrHeaders() }
+    );
   }
   outHeaders.set('content-type', 'application/json');
   return new Response(JSON.stringify(chatToResponsesResponse(cr)), { status: 200, headers: outHeaders });
@@ -650,10 +655,6 @@ export default {
       });
     } catch {
       clearTimeout(timer);
-      // /responses 异常落入透传：永不返错兜底（incomplete 流，客户端不重发）
-      if (apiPath === '/responses') {
-        return new Response(incompleteSSE('unknown', 'upstream_unavailable'), { status: 200, headers: sseHeaders() });
-      }
       return new Response(
         JSON.stringify({ error: 'upstream_failed', message: 'upstream timed out or aborted (>60s, inference pool hung)' }),
         { status: 504, headers: jsonErrHeaders() }
@@ -1023,12 +1024,14 @@ async function handleResponsesPassthroughWithRetry(
     return new Response(resp.body, { status: resp.status, headers: oh });
   }
 
-  // 正常 SSE：原样透传，仅用 guard 补 keepalive 心跳（防断连重发）+ 末端 completed 兜底（防上游截断）
+  // 正常 SSE：零 JS 处理的纯流式透传。Worker 不读取/不转换任何 chunk，CPU time ≈ 0，
+  // 彻底规避 Cloudflare Free plan 的 10ms CPU 硬上限（Error 1102）。
+  // 代价：失去 Worker 层 keepalive 心跳与 incomplete 兜底（由上游/客户端自理）。
   const oh = new Headers(resp.headers);
   oh.set('content-type', 'text/event-stream; charset=utf-8');
   oh.set('cache-control', 'no-cache');
   oh.set('Access-Control-Allow-Origin', '*');
-  return new Response(resp.body!.pipeThrough(makeResponsesStreamGuard(model, () => ac.abort())), { status: 200, headers: oh });
+  return new Response(resp.body, { status: 200, headers: oh });
 }
 
 interface Env {
