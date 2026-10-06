@@ -52,6 +52,10 @@ const STRIP_HEADERS = [
   'upgrade',
 ];
 
+// ============ 超时常量（必须先于所有引用声明）============
+// 等待上游响应头的上限；流建立后由 UPSTREAM_IDLE_TIMEOUT 负责。
+const UPSTREAM_HEADERS_TIMEOUT = 60_000;
+
 // ============ responses↔chat 协议桥（国产模型专用） ============
 
 type AnyObj = Record<string, any>;
@@ -428,7 +432,7 @@ async function handleChatBridge(
 
   const doFetch = async (): Promise<{ response: Response; abort: () => void }> => {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT);
+    const timer = setTimeout(() => ac.abort(), UPSTREAM_HEADERS_TIMEOUT);
     try {
       const response = await fetch(chatUrl.toString(), {
         method: 'POST',
@@ -644,7 +648,7 @@ export default {
     // 转发（带超时：上游 hang 时返回 504 可读错误，避免 Worker 无限等待拖垮实例；正常推理远小于 60s）
     const forwardBody = bodyText !== null ? bodyText : request.body;
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), UPSTREAM_TIMEOUT);
+    const timer = setTimeout(() => ac.abort(), UPSTREAM_HEADERS_TIMEOUT);
     let response: Response;
     try {
       response = await fetch(upstreamUrl.toString(), {
@@ -962,7 +966,7 @@ function jsonErrHeaders(): Headers {
 // 方案二（B 版·朴素透明转发）：gpt/luna 的 /responses 请求原样透传上游 SSE。
 // 不做 stream:false 缓冲、不做重试、不返回 incomplete 假成功；仅挂 keepalive 防 Codex 断连重发。
 // 上游非 200（429/500/模型不存在等）原样透传状态码+body，由客户端(Codex)自行处理。
-const UPSTREAM_HEADERS_TIMEOUT = 60_000; // 仅限制等待上游响应头；流建立后由 idle timeout 负责
+// 注：UPSTREAM_HEADERS_TIMEOUT 定义在文件顶部常量区（早于所有引用，避免 TDZ）。
 
 async function handleResponsesPassthroughWithRetry(
   rb: any,

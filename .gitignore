@@ -2,3 +2,4 @@
 .wrangler/
 *.bak
 *.diff
+node_modules/

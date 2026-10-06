@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: typecheck + guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 本项目未提交 lock 文件，用 install 而非 npm ci
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      # ★ 核心检查。
+      # esbuild/bundler 不做 TDZ 与未声明标识符检查（实测 exit=0 放过 P0），
+      # 只有 tsc 能报 TS2304 / block-scoped variable used before declaration。
+      - name: TypeScript check
+        run: npm run typecheck
+
+      # 零误报的定制体检：常量声明一致性、TDZ、密钥泄露、.dev.vars 误提交
+      - name: Guard
+        run: npm run guard
+
+      # 兜底：确认真能打包（与 wrangler deploy 走同一套 esbuild）
+      - name: Bundle check
+        run: npm run bundle:check
+
+  # 部署必须人工确认线上版本，CI 不自动 deploy。
+  # 历史教训：仓库 master 与线上部署版本曾长期不一致（UPSTREAM_* 系列问题），
+  # 自动化部署会让未验证代码直接进入生产。
+  deploy:
+    name: deploy (manual only)
+    needs: check
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "deploy is gated by human approval; run `wrangler deploy` locally after verifying"

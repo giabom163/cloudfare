@@ -2,10 +2,18 @@
   "name": "opencode-go-proxy",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
+    "guard": "node scripts/guard.mjs",
+    "check": "npm run typecheck && npm run guard",
+    "bundle:check": "esbuild src/index.ts --bundle --format=esm --outfile=/dev/null",
     "sync:catalog": "python sync-codex-model-catalog.py"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "typescript": "^5.6.0"
   }
 }
